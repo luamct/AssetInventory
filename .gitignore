@@ -98,3 +98,6 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Ignore build and cache directories
+.cache/
