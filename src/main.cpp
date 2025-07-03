@@ -209,6 +209,15 @@ bool get_texture_dimensions(const std::string &file_path, int &width,
   return false;
 }
 
+// Function to truncate filename to specified length with ellipsis
+std::string truncate_filename(const std::string &filename,
+                              size_t max_length = 20) {
+  if (filename.length() <= max_length) {
+    return filename;
+  }
+  return filename.substr(0, max_length - 3) + "...";
+}
+
 // File event callback function
 void on_file_event(const FileEvent &event) {
   std::cout << "File event: " << event.path
@@ -413,21 +422,27 @@ int main() {
     // Asset grid
     ImGui::BeginChild("AssetGrid", ImVec2(0, 0), true);
 
-    // Grid layout for assets
-    float window_width = ImGui::GetWindowWidth();
-    int columns =
-        (int)((window_width - GRID_SPACING) / (THUMBNAIL_SIZE + GRID_SPACING));
+    // Calculate grid layout upfront since all items have the same size
+    float available_width = ImGui::GetContentRegionAvail().x;
+    // Add GRID_SPACING to available width since we don't need spacing after the
+    // last item
+    int columns = (int)((available_width + GRID_SPACING) /
+                        (THUMBNAIL_SIZE + GRID_SPACING));
     if (columns < 1)
       columns = 1;
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(GRID_SPACING, GRID_SPACING));
-
-    // Display real assets from database
+    // Display real assets from database in a proper grid
     for (size_t i = 0; i < g_assets.size(); i++) {
-      if (i > 0 && i % static_cast<int>(columns) != 0) {
-        ImGui::SameLine();
-      }
+      // Calculate grid position
+      int row = i / columns;
+      int col = i % columns;
+
+      // Calculate absolute position for this grid item
+      float x_pos = col * (THUMBNAIL_SIZE + GRID_SPACING);
+      float y_pos = row * (THUMBNAIL_SIZE + GRID_SPACING);
+
+      // Set cursor to the calculated position
+      ImGui::SetCursorPos(ImVec2(x_pos, y_pos));
 
       ImGui::BeginGroup();
 
@@ -497,11 +512,12 @@ int main() {
           ImVec2(container_pos.x, container_pos.y + THUMBNAIL_SIZE + 5.0f));
 
       // Asset name below thumbnail
+      std::string truncated_name = truncate_filename(g_assets[i].name);
       ImGui::SetCursorPosX(
           ImGui::GetCursorPosX() +
-          (THUMBNAIL_SIZE - ImGui::CalcTextSize(g_assets[i].name.c_str()).x) *
+          (THUMBNAIL_SIZE - ImGui::CalcTextSize(truncated_name.c_str()).x) *
               0.5f);
-      ImGui::TextWrapped("%s", g_assets[i].name.c_str());
+      ImGui::TextWrapped("%s", truncated_name.c_str());
 
       ImGui::EndGroup();
     }
@@ -513,7 +529,6 @@ int main() {
           "No assets found. Add files to the 'assets' directory.");
     }
 
-    ImGui::PopStyleVar();
     ImGui::EndChild();
 
     ImGui::End();
