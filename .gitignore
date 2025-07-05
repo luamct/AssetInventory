@@ -101,3 +101,6 @@ Thumbs.db
 
 # Ignore build and cache directories
 .cache/
+
+# Asset files (user content)
+assets/
