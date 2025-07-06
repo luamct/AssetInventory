@@ -4,11 +4,15 @@
 #include <GL/gl.h>
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -28,18 +32,16 @@
 #include "stb_image.h"
 
 // Constants
-constexpr int WINDOW_WIDTH = 1920;         // Increased from 1280
-constexpr int WINDOW_HEIGHT = 1080;        // Increased from 720
-constexpr float SEARCH_BOX_WIDTH = 375.0f; // Increased from 250.0f
-constexpr float SEARCH_BOX_HEIGHT = 60.0f; // Increased from 40.0f
-constexpr float THUMBNAIL_SIZE = 180.0f;   // Increased from 120.0f
-constexpr float GRID_SPACING = 30.0f;      // Increased from 20.0f
+constexpr int WINDOW_WIDTH = 1920;          // Increased from 1280
+constexpr int WINDOW_HEIGHT = 1080;         // Increased from 720
+constexpr float SEARCH_BOX_WIDTH = 375.0f;  // Increased from 250.0f
+constexpr float SEARCH_BOX_HEIGHT = 60.0f;  // Increased from 40.0f
+constexpr float THUMBNAIL_SIZE = 180.0f;    // Increased from 120.0f
+constexpr float GRID_SPACING = 30.0f;       // Increased from 20.0f
 
 // Color constants
-constexpr ImU32 BACKGROUND_COLOR =
-    IM_COL32(242, 247, 255, 255); // Light blue-gray background
-constexpr ImU32 FALLBACK_THUMBNAIL_COLOR =
-    IM_COL32(242, 247, 255, 255); // Same as background
+constexpr ImU32 BACKGROUND_COLOR = IM_COL32(242, 247, 255, 255);          // Light blue-gray background
+constexpr ImU32 FALLBACK_THUMBNAIL_COLOR = IM_COL32(242, 247, 255, 255);  // Same as background
 
 // Global variables for search and UI state
 static char search_buffer[256] = "";
@@ -57,19 +59,21 @@ struct TextureCacheEntry {
   TextureCacheEntry() : texture_id(0), is_loaded(false), width(0), height(0) {}
 };
 
-static std::map<std::string, TextureCacheEntry> g_texture_cache;
-static unsigned int g_default_texture = 0; // Generic texture icon
+// Global variables
+std::vector<FileInfo> g_assets;
+std::vector<FileInfo> g_filtered_assets;
+std::atomic<bool> g_assets_updated(false);
+AssetDatabase g_database;
+FileWatcher g_file_watcher;
+unsigned int g_default_texture = 0;
 
-// Global variables for database and file watching
-static AssetDatabase g_database;
-static FileWatcher g_file_watcher;
-static std::vector<FileInfo> g_assets;
-static std::atomic<bool> g_assets_updated(false);
+// Texture cache
+std::unordered_map<std::string, TextureCacheEntry> g_texture_cache;
 
 bool load_roboto_font(ImGuiIO &io) {
   // Load embedded Roboto font from external/fonts directory
-  ImFont *font = io.Fonts->AddFontFromFileTTF(
-      "external/fonts/Roboto-Regular.ttf", 24.0f); // Increased from 16.0f
+  ImFont *font = io.Fonts->AddFontFromFileTTF("external/fonts/Roboto-Regular.ttf",
+                                              24.0f);  // Increased from 16.0f
   if (font) {
     std::cout << "Roboto font loaded successfully!\n";
     return true;
@@ -77,12 +81,11 @@ bool load_roboto_font(ImGuiIO &io) {
 
   // Fallback: try system fonts if embedded font not found
   // FIXME: Remove this, since we're using embedded font now
-  const char *font_paths[] = {"C:/Windows/Fonts/Roboto-Regular.ttf",
-                              "C:/Windows/Fonts/roboto.ttf",
+  const char *font_paths[] = {"C:/Windows/Fonts/Roboto-Regular.ttf", "C:/Windows/Fonts/roboto.ttf",
                               "C:/Windows/Fonts/Roboto-Medium.ttf"};
 
   for (const char *path : font_paths) {
-    font = io.Fonts->AddFontFromFileTTF(path, 24.0f); // Increased from 16.0f
+    font = io.Fonts->AddFontFromFileTTF(path, 24.0f);  // Increased from 16.0f
     if (font) {
       std::cout << "Roboto font loaded from system: " << path << '\n';
       return true;
@@ -114,18 +117,15 @@ unsigned int load_texture(const char *filename) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
   // Upload texture data
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
-               GL_UNSIGNED_BYTE, data);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
 
   stbi_image_free(data);
   return texture_id;
 }
 
 // Function to calculate aspect-ratio-preserving dimensions
-ImVec2 calculate_thumbnail_size(int original_width, int original_height,
-                                float max_size) {
-  float aspect_ratio =
-      static_cast<float>(original_width) / static_cast<float>(original_height);
+ImVec2 calculate_thumbnail_size(int original_width, int original_height, float max_size) {
+  float aspect_ratio = static_cast<float>(original_width) / static_cast<float>(original_height);
 
   if (aspect_ratio > 1.0f) {
     // Landscape image
@@ -153,8 +153,7 @@ unsigned int get_asset_texture(const FileInfo &asset) {
 
   // Load the texture and get dimensions
   int width, height, channels;
-  unsigned char *data =
-      stbi_load(asset.full_path.c_str(), &width, &height, &channels, 4);
+  unsigned char *data = stbi_load(asset.full_path.c_str(), &width, &height, &channels, 4);
   if (!data) {
     std::cerr << "Failed to load texture: " << asset.full_path << '\n';
     // Cache the failure
@@ -178,8 +177,7 @@ unsigned int get_asset_texture(const FileInfo &asset) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
   // Upload texture data
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
-               GL_UNSIGNED_BYTE, data);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
 
   stbi_image_free(data);
 
@@ -191,15 +189,11 @@ unsigned int get_asset_texture(const FileInfo &asset) {
   entry.width = width;
   entry.height = height;
 
-  std::cout << "Loaded texture: " << asset.name << " (" << width << "x"
-            << height << ")\n";
-
   return texture_id;
 }
 
 // Function to get cached texture dimensions
-bool get_texture_dimensions(const std::string &file_path, int &width,
-                            int &height) {
+bool get_texture_dimensions(const std::string &file_path, int &width, int &height) {
   auto it = g_texture_cache.find(file_path);
   if (it != g_texture_cache.end() && it->second.is_loaded) {
     width = it->second.width;
@@ -210,75 +204,154 @@ bool get_texture_dimensions(const std::string &file_path, int &width,
 }
 
 // Function to truncate filename to specified length with ellipsis
-std::string truncate_filename(const std::string &filename,
-                              size_t max_length = 20) {
+std::string truncate_filename(const std::string &filename, size_t max_length = 20) {
   if (filename.length() <= max_length) {
     return filename;
   }
   return filename.substr(0, max_length - 3) + "...";
 }
 
+// Function to convert string to lowercase for case-insensitive search
+std::string to_lowercase(const std::string &str) {
+  std::string result = str;
+  std::transform(result.begin(), result.end(), result.begin(), ::tolower);
+  return result;
+}
+
+// Function to check if asset matches search terms
+bool asset_matches_search(const FileInfo &asset, const std::string &search_query) {
+  if (search_query.empty()) {
+    return true;  // Show all assets when search is empty
+  }
+
+  std::string query_lower = to_lowercase(search_query);
+  std::string name_lower = to_lowercase(asset.name);
+  std::string extension_lower = to_lowercase(asset.extension);
+  std::string path_lower = to_lowercase(asset.full_path);
+
+  // Split search query into terms (space-separated)
+  std::vector<std::string> search_terms;
+  std::stringstream ss(query_lower);
+  std::string search_term;
+  while (ss >> search_term) {
+    if (!search_term.empty()) {
+      search_terms.push_back(search_term);
+    }
+  }
+
+  // All terms must match (AND logic)
+  for (const auto &term : search_terms) {
+    bool term_matches = name_lower.find(term) != std::string::npos || extension_lower.find(term) != std::string::npos ||
+                        path_lower.find(term) != std::string::npos;
+
+    if (!term_matches) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Function to filter assets based on search query
+void filter_assets(const std::string &search_query) {
+  g_filtered_assets.clear();
+
+  for (const auto &asset : g_assets) {
+    if (asset_matches_search(asset, search_query)) {
+      g_filtered_assets.push_back(asset);
+    }
+  }
+}
+
 // File event callback function
 void on_file_event(const FileEvent &event) {
-  std::cout << "File event: " << event.path
-            << " (type: " << static_cast<int>(event.type) << ")\n";
-
   switch (event.type) {
-  case FileEventType::Created:
-  case FileEventType::Modified: {
-    // Check if it's a file (not directory)
-    if (std::filesystem::is_regular_file(event.path)) {
-      FileInfo file_info;
-      std::filesystem::path path(event.path);
+    case FileEventType::Created:
+      // Fall through to Modified case
+    case FileEventType::Modified: {
+      // Check if it's a file (not directory)
+      if (std::filesystem::is_regular_file(event.path)) {
+        // Clear texture cache entry for this file so it can be reloaded
+        auto cache_it = g_texture_cache.find(event.path);
+        if (cache_it != g_texture_cache.end()) {
+          // If there's an existing texture, delete it from OpenGL
+          if (cache_it->second.is_loaded && cache_it->second.texture_id != 0) {
+            glDeleteTextures(1, &cache_it->second.texture_id);
+          }
+          // Remove from cache
+          g_texture_cache.erase(cache_it);
+        }
 
-      file_info.name = path.filename().string();
-      file_info.extension = path.extension().string();
-      file_info.full_path = event.path;
-      file_info.relative_path = event.path; // For now, use full path
-      file_info.size = std::filesystem::file_size(event.path);
-      file_info.last_modified = event.timestamp;
-      file_info.is_directory = false;
-      file_info.type = get_asset_type(file_info.extension);
+        FileInfo file_info;
+        std::filesystem::path path(event.path);
 
-      // Insert or update in database
-      if (g_database.get_asset_by_path(event.path).full_path.empty()) {
-        g_database.insert_asset(file_info);
-      } else {
-        g_database.update_asset(file_info);
+        file_info.name = path.filename().string();
+        file_info.extension = path.extension().string();
+        file_info.full_path = event.path;
+        file_info.relative_path = event.path;  // For now, use full path
+        file_info.size = std::filesystem::file_size(event.path);
+        file_info.last_modified = event.timestamp;
+        file_info.is_directory = false;
+        file_info.type = get_asset_type(file_info.extension);
+
+        // Insert or update in database
+        auto existing_asset = g_database.get_asset_by_path(event.path);
+        if (existing_asset.full_path.empty()) {
+          g_database.insert_asset(file_info);
+        } else {
+          g_database.update_asset(file_info);
+        }
+        g_assets_updated = true;
       }
-      g_assets_updated = true;
+      break;
     }
-    break;
-  }
-  case FileEventType::Deleted: {
-    g_database.delete_asset(event.path);
-    g_assets_updated = true;
-    break;
-  }
-  case FileEventType::Renamed: {
-    // Delete old entry and create new one
-    g_database.delete_asset(event.old_path);
+    case FileEventType::Deleted: {
+      // Clear texture cache entry for deleted file
+      auto cache_it = g_texture_cache.find(event.path);
+      if (cache_it != g_texture_cache.end()) {
+        if (cache_it->second.is_loaded && cache_it->second.texture_id != 0) {
+          glDeleteTextures(1, &cache_it->second.texture_id);
+        }
+        g_texture_cache.erase(cache_it);
+      }
 
-    if (std::filesystem::is_regular_file(event.path)) {
-      FileInfo file_info;
-      std::filesystem::path path(event.path);
-
-      file_info.name = path.filename().string();
-      file_info.extension = path.extension().string();
-      file_info.full_path = event.path;
-      file_info.relative_path = event.path;
-      file_info.size = std::filesystem::file_size(event.path);
-      file_info.last_modified = event.timestamp;
-      file_info.is_directory = false;
-      file_info.type = get_asset_type(file_info.extension);
-
-      g_database.insert_asset(file_info);
+      g_database.delete_asset(event.path);
       g_assets_updated = true;
+      break;
     }
-    break;
-  }
-  default:
-    break;
+    case FileEventType::Renamed: {
+      // Clear texture cache entry for old path
+      auto cache_it = g_texture_cache.find(event.old_path);
+      if (cache_it != g_texture_cache.end()) {
+        if (cache_it->second.is_loaded && cache_it->second.texture_id != 0) {
+          glDeleteTextures(1, &cache_it->second.texture_id);
+        }
+        g_texture_cache.erase(cache_it);
+      }
+
+      // Delete old entry and create new one
+      g_database.delete_asset(event.old_path);
+
+      if (std::filesystem::is_regular_file(event.path)) {
+        FileInfo file_info;
+        std::filesystem::path path(event.path);
+
+        file_info.name = path.filename().string();
+        file_info.extension = path.extension().string();
+        file_info.full_path = event.path;
+        file_info.relative_path = event.path;
+        file_info.size = std::filesystem::file_size(event.path);
+        file_info.last_modified = event.timestamp;
+        file_info.is_directory = false;
+        file_info.type = get_asset_type(file_info.extension);
+
+        g_database.insert_asset(file_info);
+        g_assets_updated = true;
+      }
+      break;
+    }
+    default:
+      break;
   }
 }
 
@@ -300,6 +373,7 @@ int main() {
   if (!initial_assets.empty()) {
     g_database.insert_assets_batch(initial_assets);
     g_assets = g_database.get_all_assets();
+    g_filtered_assets = g_assets;  // Initialize filtered assets
   }
 
   // Start file watching
@@ -318,8 +392,7 @@ int main() {
   }
 
   // Create window
-  GLFWwindow *window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT,
-                                        "Asset Inventory", nullptr, nullptr);
+  GLFWwindow *window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Asset Inventory", nullptr, nullptr);
   if (!window) {
     std::cerr << "Failed to create GLFW window\n";
     glfwTerminate();
@@ -327,7 +400,7 @@ int main() {
   }
 
   glfwMakeContextCurrent(window);
-  glfwSwapInterval(1); // Enable vsync
+  glfwSwapInterval(1);  // Enable vsync
 
   // Initialize Dear ImGui
   IMGUI_CHECKVERSION();
@@ -375,14 +448,15 @@ int main() {
     // Check if assets were updated and refresh the list
     if (g_assets_updated.exchange(false)) {
       g_assets = g_database.get_all_assets();
+      // Re-apply current search filter to include new assets
+      filter_assets(search_buffer);
     }
 
     // Create main window
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
     ImGui::Begin("Asset Inventory", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoMove);
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
     // Header
     ImGui::PushFont(io.Fonts->Fonts[0]);
@@ -393,28 +467,35 @@ int main() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Search box - centered, smaller width, thicker (larger height)
-    ImGui::SetCursorPosX((ImGui::GetWindowSize().x - SEARCH_BOX_WIDTH) * 0.5f);
-    ImGui::PushItemWidth(SEARCH_BOX_WIDTH);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 25.0f); // Capsule shape
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                        ImVec2(12, (SEARCH_BOX_HEIGHT - ImGui::GetFontSize()) *
-                                       0.5f)); // Thicker box
-    bool search_activated =
-        ImGui::InputText("##Search", search_buffer, sizeof(search_buffer),
-                         ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::PopStyleVar(2);
-    ImGui::PopItemWidth();
-    if (search_activated) {
-      std::cout << "Searching for: " << search_buffer << '\n';
-    }
+    // Search box - create capsule background first
+    float search_x = (ImGui::GetWindowSize().x - SEARCH_BOX_WIDTH) * 0.5f;
+    float search_y = ImGui::GetCursorPosY();
 
-    // Add placeholder text
-    if (search_buffer[0] == '\0') {
-      ImGui::SameLine();
-      ImGui::SetCursorPosX(ImGui::GetCursorPosX() - (SEARCH_BOX_WIDTH - 10));
-      ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Search assets...");
-    }
+    // Draw capsule background
+    ImVec2 capsule_min(search_x, search_y);
+    ImVec2 capsule_max(search_x + SEARCH_BOX_WIDTH, search_y + SEARCH_BOX_HEIGHT);
+    ImGui::GetWindowDrawList()->AddRectFilled(capsule_min, capsule_max,
+                                              IM_COL32(255, 255, 255, 255),  // White background
+                                              25.0f                          // Rounded corners
+    );
+
+    // Position text input inside the capsule
+    ImGui::SetCursorPos(ImVec2(search_x + 20,
+                               search_y + (SEARCH_BOX_HEIGHT - ImGui::GetFontSize()) * 0.5f - 4));  // Move up 2 pixels
+    ImGui::PushItemWidth(SEARCH_BOX_WIDTH - 40);  // Leave space for padding
+
+    // Remove borders from text input
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));  // Transparent background
+
+    ImGui::InputText("##Search", search_buffer, sizeof(search_buffer), ImGuiInputTextFlags_EnterReturnsTrue);
+
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    ImGui::PopItemWidth();
+
+    // Filter assets in real-time as user types
+    filter_assets(search_buffer);
 
     ImGui::Spacing();
     ImGui::Spacing();
@@ -426,16 +507,14 @@ int main() {
     float available_width = ImGui::GetContentRegionAvail().x;
     // Add GRID_SPACING to available width since we don't need spacing after the
     // last item
-    int columns = (int)((available_width + GRID_SPACING) /
-                        (THUMBNAIL_SIZE + GRID_SPACING));
-    if (columns < 1)
-      columns = 1;
+    int columns = static_cast<int>((available_width + GRID_SPACING) / (THUMBNAIL_SIZE + GRID_SPACING));
+    if (columns < 1) columns = 1;
 
-    // Display real assets from database in a proper grid
-    for (size_t i = 0; i < g_assets.size(); i++) {
+    // Display filtered assets in a proper grid
+    for (size_t i = 0; i < g_filtered_assets.size(); i++) {
       // Calculate grid position
-      int row = i / columns;
-      int col = i % columns;
+      int row = static_cast<int>(i) / columns;
+      int col = static_cast<int>(i) % columns;
 
       // Calculate absolute position for this grid item
       float x_pos = col * (THUMBNAIL_SIZE + GRID_SPACING);
@@ -447,29 +526,26 @@ int main() {
       ImGui::BeginGroup();
 
       // Get texture for this asset
-      unsigned int asset_texture = get_asset_texture(g_assets[i]);
+      unsigned int asset_texture = get_asset_texture(g_filtered_assets[i]);
 
       // Calculate display size based on asset type
       ImVec2 display_size(THUMBNAIL_SIZE, THUMBNAIL_SIZE);
-      if (g_assets[i].type == AssetType::Texture && asset_texture != 0) {
+      if (g_filtered_assets[i].type == AssetType::Texture && asset_texture != 0) {
         // Get texture dimensions and calculate aspect-ratio-preserving size
         int width, height;
-        if (get_texture_dimensions(g_assets[i].full_path, width, height)) {
-          display_size =
-              calculate_thumbnail_size(width, height, THUMBNAIL_SIZE);
+        if (get_texture_dimensions(g_filtered_assets[i].full_path, width, height)) {
+          display_size = calculate_thumbnail_size(width, height, THUMBNAIL_SIZE);
         }
       }
 
       // Create a fixed-size container for consistent layout
       ImVec2 container_size(THUMBNAIL_SIZE,
-                            THUMBNAIL_SIZE + 40.0f); // Extra space for text
+                            THUMBNAIL_SIZE + 40.0f);  // Extra space for text
       ImVec2 container_pos = ImGui::GetCursorScreenPos();
 
       // Draw background for the container (same as app background)
       ImGui::GetWindowDrawList()->AddRectFilled(
-          container_pos,
-          ImVec2(container_pos.x + container_size.x,
-                 container_pos.y + container_size.y),
+          container_pos, ImVec2(container_pos.x + container_size.x, container_pos.y + container_size.y),
           BACKGROUND_COLOR);
 
       // Calculate position to center the image vertically in the container
@@ -478,55 +554,50 @@ int main() {
 
       ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 0.f));
       ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.f, 0.f, 0.f, 0.f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                            ImVec4(0.f, 0.f, 0.f, 0.3f));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.f, 0.f, 0.f, 0.3f));
 
       // Display thumbnail image
       if (asset_texture != 0) {
         ImGui::SetCursorScreenPos(image_pos);
-        if (ImGui::ImageButton(("##Thumbnail" + std::to_string(i)).c_str(),
-                               (ImTextureID)(intptr_t)asset_texture,
+        if (ImGui::ImageButton(("##Thumbnail" + std::to_string(i)).c_str(), (ImTextureID)(intptr_t)asset_texture,
                                display_size)) {
-          std::cout << "Selected: " << g_assets[i].name << '\n';
+          std::cout << "Selected: " << g_filtered_assets[i].name << '\n';
         }
       } else {
         // Fallback: colored button if texture failed to load
         ImGui::SetCursorScreenPos(image_pos);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
-        if (ImGui::Button(("##Thumbnail" + std::to_string(i)).c_str(),
-                          display_size)) {
-          std::cout << "Selected: " << g_assets[i].name << '\n';
+        if (ImGui::Button(("##Thumbnail" + std::to_string(i)).c_str(), display_size)) {
+          std::cout << "Selected: " << g_filtered_assets[i].name << '\n';
         }
         ImGui::PopStyleVar();
 
         // Add a background to simulate thumbnail (same as app background)
-        ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(),
-                                                  ImGui::GetItemRectMax(),
+        ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
                                                   FALLBACK_THUMBNAIL_COLOR);
       }
 
       ImGui::PopStyleColor(3);
 
       // Position text at the bottom of the container
-      ImGui::SetCursorScreenPos(
-          ImVec2(container_pos.x, container_pos.y + THUMBNAIL_SIZE + 5.0f));
+      ImGui::SetCursorScreenPos(ImVec2(container_pos.x, container_pos.y + THUMBNAIL_SIZE + 5.0f));
 
       // Asset name below thumbnail
-      std::string truncated_name = truncate_filename(g_assets[i].name);
-      ImGui::SetCursorPosX(
-          ImGui::GetCursorPosX() +
-          (THUMBNAIL_SIZE - ImGui::CalcTextSize(truncated_name.c_str()).x) *
-              0.5f);
+      std::string truncated_name = truncate_filename(g_filtered_assets[i].name);
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                           (THUMBNAIL_SIZE - ImGui::CalcTextSize(truncated_name.c_str()).x) * 0.5f);
       ImGui::TextWrapped("%s", truncated_name.c_str());
 
       ImGui::EndGroup();
     }
 
     // Show message if no assets found
-    if (g_assets.empty()) {
-      ImGui::TextColored(
-          ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-          "No assets found. Add files to the 'assets' directory.");
+    if (g_filtered_assets.empty()) {
+      if (g_assets.empty()) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No assets found. Add files to the 'assets' directory.");
+      } else {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No assets match your search.");
+      }
     }
 
     ImGui::EndChild();

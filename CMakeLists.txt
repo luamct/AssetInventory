@@ -17,6 +17,8 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
     # Explicitly exclude the static runtime library that's causing conflicts
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /NODEFAULTLIB:LIBCMT")
+    # Suppress LNK4098 warning about runtime library conflicts
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /IGNORE:4098")
 endif()
 
 # MSVC-specific settings
@@ -93,10 +95,20 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
+# Create ImGui library target
+add_library(imgui STATIC ${IMGUI_SOURCES})
+target_include_directories(imgui PRIVATE ${IMGUI_DIR} ${IMGUI_DIR}/backends ${GLFW_INCLUDE_DIR})
+
+# Set ImGui runtime library to match main application
+if(MSVC)
+    set_property(TARGET imgui PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    # Suppress warnings for ImGui
+    target_compile_options(imgui PRIVATE)
+endif()
+
 # File watcher sources
 set(FILE_WATCHER_SOURCES
     src/file_watcher.cpp
-    src/file_watcher_polling.cpp
 )
 
 # Platform-specific file watcher sources
@@ -115,23 +127,12 @@ add_executable(AssetInventory
     src/main.cpp
     src/asset_index.cpp
     src/asset_database.cpp
-    ${IMGUI_SOURCES}
     ${FILE_WATCHER_SOURCES}
 )
 
 # Set runtime library for all executables
 if(MSVC)
     set_property(TARGET AssetInventory PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-endif()
-
-# Add file watcher test executable
-add_executable(FileWatcherTest
-    tests/test_file_watcher.cpp
-    ${FILE_WATCHER_SOURCES}
-)
-
-if(MSVC)
-    set_property(TARGET FileWatcherTest PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
 # Add database test executable
@@ -145,53 +146,20 @@ if(MSVC)
     set_property(TARGET DatabaseTest PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
-# Add database inspection executable
-add_executable(InspectDB
-    src/inspect_db.cpp
-    src/asset_index.cpp
-    src/asset_database.cpp
-)
-
-if(MSVC)
-    set_property(TARGET InspectDB PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-endif()
-
 # Set compiler flags for our own code
 if(MSVC)
     target_compile_options(AssetInventory PRIVATE /W4)
-    target_compile_options(FileWatcherTest PRIVATE /W4)
     target_compile_options(DatabaseTest PRIVATE /W4)
-    target_compile_options(InspectDB PRIVATE /W4)
 endif()
 
 # Suppress warnings for external libraries
 if(MSVC)
-    set(EXTERNAL_WARNING_FLAGS /w)
-
-    # SQLite (C library)
-    target_compile_options(sqlite3 PRIVATE ${EXTERNAL_WARNING_FLAGS})
-
-    # GLFW is pre-built binary, no warning suppression needed
-
-    # ImGui sources (C++ but external)
-    foreach(imgui_source ${IMGUI_SOURCES})
-        set_source_files_properties(${imgui_source} PROPERTIES COMPILE_FLAGS ${EXTERNAL_WARNING_FLAGS})
-    endforeach()
-
-    # Suppress warnings for stb_image.h specifically
-    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/stb_image.h PROPERTIES COMPILE_FLAGS ${EXTERNAL_WARNING_FLAGS})
+    # SQLite (C library) - suppress all warnings
+    target_compile_options(sqlite3 PRIVATE)
 endif()
 
 # Include directories
 target_include_directories(AssetInventory PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${IMGUI_DIR}
-    ${IMGUI_DIR}/backends
-    ${SQLITE_DIR}
-    ${GLFW_INCLUDE_DIR}
-)
-
-target_include_directories(FileWatcherTest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
@@ -207,19 +175,12 @@ target_include_directories(DatabaseTest PRIVATE
     ${GLFW_INCLUDE_DIR}
 )
 
-target_include_directories(InspectDB PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${IMGUI_DIR}
-    ${IMGUI_DIR}/backends
-    ${SQLITE_DIR}
-    ${GLFW_INCLUDE_DIR}
-)
-
 # Link libraries
 target_link_libraries(AssetInventory PRIVATE
     glfw
     OpenGL::GL
     sqlite3
+    imgui
 )
 
 # Add filesystem library for MSVC
@@ -227,26 +188,9 @@ if(MSVC)
     target_link_libraries(AssetInventory PRIVATE legacy_stdio_definitions)
 endif()
 
-
-
-target_link_libraries(FileWatcherTest PRIVATE
-    glfw
-    OpenGL::GL
-)
-
-
-
 target_link_libraries(DatabaseTest PRIVATE
     sqlite3
 )
-
-
-
-target_link_libraries(InspectDB PRIVATE
-    sqlite3
-)
-
-
 
 # Copy font file to build directory
 add_custom_command(TARGET AssetInventory POST_BUILD

@@ -2,14 +2,30 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <unordered_map>
 
 #include "file_watcher.h"
+
+// Structure to track pending file events
+struct PendingFileEvent {
+  FileEventType original_type;
+  std::string path;
+  std::string old_path;  // For rename events
+  std::chrono::steady_clock::time_point last_activity;
+  bool is_active;
+
+  PendingFileEvent() : original_type(FileEventType::Modified), is_active(false) {}
+
+  PendingFileEvent(FileEventType type, const std::string& p, const std::string& old = "")
+      : original_type(type), path(p), old_path(old), last_activity(std::chrono::steady_clock::now()), is_active(true) {}
+};
 
 class WindowsFileWatcher : public FileWatcherImpl {
  private:
@@ -25,17 +41,22 @@ class WindowsFileWatcher : public FileWatcherImpl {
   char buffer[4096];
   DWORD bytes_returned;
 
-  // Thread-safe event queue
-  std::queue<FileEvent> event_queue;
-  std::mutex queue_mutex;
-  std::condition_variable queue_cv;
+  // Timer-based event tracking
+  std::unordered_map<std::string, PendingFileEvent> pending_events;
+  std::mutex pending_events_mutex;
+  std::thread timer_thread;
+  std::atomic<bool> timer_should_stop;
+
+  // Timer configuration
+  static constexpr int DEBOUNCE_TIMEOUT_MS = 500;
 
  public:
   WindowsFileWatcher()
       : h_directory(INVALID_HANDLE_VALUE),
         h_event(INVALID_HANDLE_VALUE),
         should_stop(false),
-        is_watching_flag(false) {}
+        is_watching_flag(false),
+        timer_should_stop(false) {}
 
   ~WindowsFileWatcher() { stop_watching(); }
 
@@ -56,11 +77,9 @@ class WindowsFileWatcher : public FileWatcherImpl {
     }
 
     // Open directory handle
-    h_directory = CreateFileW(
-        std::wstring(path.begin(), path.end()).c_str(), FILE_LIST_DIRECTORY,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-        nullptr);
+    h_directory = CreateFileW(std::wstring(path.begin(), path.end()).c_str(), FILE_LIST_DIRECTORY,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                              FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
 
     if (h_directory == INVALID_HANDLE_VALUE) {
       std::cerr << "Failed to open directory: " << GetLastError() << '\n';
@@ -69,10 +88,14 @@ class WindowsFileWatcher : public FileWatcherImpl {
     }
 
     should_stop = false;
+    timer_should_stop = false;
     is_watching_flag = true;
 
     // Start watching thread
     watch_thread = std::thread(&WindowsFileWatcher::watch_loop, this);
+
+    // Start timer thread for processing pending events
+    timer_thread = std::thread(&WindowsFileWatcher::timer_loop, this);
 
     std::cout << "Started watching directory: " << path << '\n';
     return true;
@@ -82,15 +105,20 @@ class WindowsFileWatcher : public FileWatcherImpl {
     if (!is_watching_flag.load()) return;
 
     should_stop = true;
+    timer_should_stop = true;
 
     // Signal the event to wake up the thread
     if (h_event != INVALID_HANDLE_VALUE) {
       SetEvent(h_event);
     }
 
-    // Wait for thread to finish
+    // Wait for threads to finish
     if (watch_thread.joinable()) {
       watch_thread.join();
+    }
+
+    if (timer_thread.joinable()) {
+      timer_thread.join();
     }
 
     // Clean up handles
@@ -104,6 +132,12 @@ class WindowsFileWatcher : public FileWatcherImpl {
       h_event = INVALID_HANDLE_VALUE;
     }
 
+    // Clear pending events
+    {
+      std::lock_guard<std::mutex> lock(pending_events_mutex);
+      pending_events.clear();
+    }
+
     is_watching_flag = false;
     std::cout << "Stopped watching directory: " << watched_path << '\n';
   }
@@ -111,65 +145,78 @@ class WindowsFileWatcher : public FileWatcherImpl {
   bool is_watching() const override { return is_watching_flag.load(); }
 
  private:
-  void perform_initial_scan(const std::string& directory_path) {
-    try {
-      std::filesystem::path path(directory_path);
+  void timer_loop() {
+    while (!timer_should_stop.load()) {
+      auto now = std::chrono::steady_clock::now();
+      std::vector<std::pair<std::string, PendingFileEvent>> events_to_process;
 
-      if (!std::filesystem::exists(path)) {
-        std::cerr << "Directory does not exist: " << directory_path << '\n';
-        return;
+      {
+        std::lock_guard<std::mutex> lock(pending_events_mutex);
+
+        for (auto it = pending_events.begin(); it != pending_events.end();) {
+          auto& pending = it->second;
+
+          if (!pending.is_active) {
+            // Event has been cancelled (e.g., file deleted)
+            it = pending_events.erase(it);
+            continue;
+          }
+
+          auto time_since_activity =
+              std::chrono::duration_cast<std::chrono::milliseconds>(now - pending.last_activity).count();
+
+          if (time_since_activity >= DEBOUNCE_TIMEOUT_MS) {
+            // Event has timed out, store it for processing
+            events_to_process.push_back({it->first, pending});
+            it = pending_events.erase(it);
+          } else {
+            ++it;
+          }
+        }
       }
 
-      if (!std::filesystem::is_directory(path)) {
-        std::cerr << "Path is not a directory: " << directory_path << '\n';
-        return;
+      // Process timed-out events
+      for (const auto& [path, pending] : events_to_process) {
+        if (callback) {
+          // Determine the final event type based on the original event
+          FileEventType final_type;
+          if (pending.original_type == FileEventType::Created) {
+            final_type = FileEventType::Created;
+          } else {
+            final_type = FileEventType::Modified;
+          }
+
+          FileEvent event(final_type, path, pending.old_path);
+          callback(event);
+        }
       }
 
-      // Recursively scan the directory
-      scan_directory_recursive(path, directory_path);
-
-      std::cout << "Initial scan completed\n";
-    } catch (const std::filesystem::filesystem_error& e) {
-      std::cerr << "Filesystem error during initial scan: " << e.what() << '\n';
-    } catch (const std::exception& e) {
-      std::cerr << "Error during initial scan: " << e.what() << '\n';
+      // Sleep for a short interval before checking again
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   }
 
-  void scan_directory_recursive(const std::filesystem::path& current_path,
-                                const std::string& base_path) {
-    try {
-      for (const auto& entry :
-           std::filesystem::recursive_directory_iterator(current_path)) {
-        if (should_stop.load()) {
-          return;  // Stop scanning if we're being shut down
-        }
+  void process_raw_file_event(FileEventType raw_type, const std::string& full_path, const std::string& old_path = "") {
+    std::lock_guard<std::mutex> lock(pending_events_mutex);
 
-        std::string relative_path =
-            std::filesystem::relative(entry.path(), base_path).string();
-        std::string full_path = entry.path().string();
-
-        // Convert backslashes to forward slashes for consistency
-        std::replace(relative_path.begin(), relative_path.end(), '\\', '/');
-        std::replace(full_path.begin(), full_path.end(), '\\', '/');
-
-        if (std::filesystem::is_directory(entry)) {
-          // Create event for directory
-          FileEvent event(FileEventType::DirectoryCreated, full_path);
-          if (callback) {
-            callback(event);
-          }
-        } else if (std::filesystem::is_regular_file(entry)) {
-          // Create event for file
-          FileEvent event(FileEventType::Created, full_path);
-          if (callback) {
-            callback(event);
-          }
-        }
+    // For Deleted and Renamed, process immediately
+    if (raw_type == FileEventType::Deleted || raw_type == FileEventType::Renamed) {
+      if (callback) {
+        FileEvent event(raw_type, full_path, old_path);
+        callback(event);
       }
-    } catch (const std::filesystem::filesystem_error& e) {
-      std::cerr << "Error scanning directory " << current_path.string() << ": "
-                << e.what() << '\n';
+      return;
+    }
+
+    auto it = pending_events.find(full_path);
+    if (it == pending_events.end()) {
+      // First event for this file, store all attributes
+      pending_events[full_path] = PendingFileEvent(raw_type, full_path, old_path);
+    } else {
+      // Only update last_activity and is_active
+      it->second.last_activity = std::chrono::steady_clock::now();
+      it->second.is_active = true;
+      // Optionally, update old_path for rename tracking if needed
     }
   }
 
@@ -179,13 +226,12 @@ class WindowsFileWatcher : public FileWatcherImpl {
 
     while (!should_stop.load()) {
       // Start monitoring
-      if (!ReadDirectoryChangesW(
-              h_directory, buffer, sizeof(buffer),
-              TRUE,  // Watch subtree
-              FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
-                  FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE |
-                  FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_CREATION,
-              nullptr, &overlapped, nullptr)) {
+      if (!ReadDirectoryChangesW(h_directory, buffer, sizeof(buffer),
+                                 TRUE,  // Watch subtree
+                                 FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                                     FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE |
+                                     FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_CREATION,
+                                 nullptr, &overlapped, nullptr)) {
         std::cerr << "ReadDirectoryChangesW failed: " << GetLastError() << '\n';
         break;
       }
@@ -200,8 +246,7 @@ class WindowsFileWatcher : public FileWatcherImpl {
       if (wait_result == WAIT_OBJECT_0) {
         // Get the overlapped result
         DWORD bytes_transferred;
-        if (GetOverlappedResult(h_directory, &overlapped, &bytes_transferred,
-                                FALSE)) {
+        if (GetOverlappedResult(h_directory, &overlapped, &bytes_transferred, FALSE)) {
           process_file_changes(buffer, bytes_transferred);
         }
 
@@ -211,59 +256,51 @@ class WindowsFileWatcher : public FileWatcherImpl {
     }
   }
 
-  void process_file_changes(const char* change_buffer,
-                            DWORD bytes_transferred) {
+  void process_file_changes(const char* change_buffer, DWORD bytes_transferred) {
     (void)bytes_transferred;  // Suppress unused parameter warning
 
-    const FILE_NOTIFY_INFORMATION* p_notify =
-        reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(change_buffer);
+    const FILE_NOTIFY_INFORMATION* p_notify = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(change_buffer);
 
     while (p_notify) {
       // Convert wide string to UTF-8 properly
-      std::wstring wide_name(p_notify->FileName,
-                             p_notify->FileNameLength / sizeof(WCHAR));
+      std::wstring wide_name(p_notify->FileName, p_notify->FileNameLength / sizeof(WCHAR));
       std::string file_name = wide_string_to_utf8(wide_name);
 
-      // Determine event type
-      FileEventType event_type = FileEventType::Modified;  // Default
+      // Create full path
+      std::string full_path = watched_path + "\\" + file_name;
+
+      // Determine raw event type
+      FileEventType raw_event_type = FileEventType::Modified;  // Default
       switch (p_notify->Action) {
         case FILE_ACTION_ADDED:
-          event_type = FileEventType::Created;
+          raw_event_type = FileEventType::Created;
           break;
         case FILE_ACTION_REMOVED:
-          event_type = FileEventType::Deleted;
+          raw_event_type = FileEventType::Deleted;
           break;
         case FILE_ACTION_MODIFIED:
-          event_type = FileEventType::Modified;
+          raw_event_type = FileEventType::Modified;
           break;
         case FILE_ACTION_RENAMED_OLD_NAME:
           // We'll handle rename in the next iteration
           break;
         case FILE_ACTION_RENAMED_NEW_NAME:
-          event_type = FileEventType::Renamed;
+          raw_event_type = FileEventType::Renamed;
           break;
         default:
-          event_type = FileEventType::Modified;
+          raw_event_type = FileEventType::Modified;
           break;
       }
 
-      // Create full path
-      std::string full_path = watched_path + "\\" + file_name;
-
-      // Create and queue event
-      FileEvent event(event_type, full_path);
-
-      // Call callback in main thread context
-      if (callback) {
-        callback(event);
-      }
+      // Process the raw event (will be debounced for Created/Modified)
+      process_raw_file_event(raw_event_type, full_path);
 
       // Move to next notification
       if (p_notify->NextEntryOffset == 0) {
         break;
       }
-      p_notify = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(
-          reinterpret_cast<const char*>(p_notify) + p_notify->NextEntryOffset);
+      p_notify = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(reinterpret_cast<const char*>(p_notify) +
+                                                                  p_notify->NextEntryOffset);
     }
   }
 
@@ -271,13 +308,13 @@ class WindowsFileWatcher : public FileWatcherImpl {
   std::string wide_string_to_utf8(const std::wstring& wide_str) {
     if (wide_str.empty()) return std::string();
 
-    // Convert wide string to UTF-8
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, wide_str.data(), -1,
-                                          nullptr, 0, nullptr, nullptr);
+    // Convert wide string to UTF-8 using actual length (not null-terminated)
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, wide_str.data(), static_cast<int>(wide_str.length()), nullptr, 0,
+                                          nullptr, nullptr);
     if (size_needed > 0) {
       std::string utf8_str(size_needed, 0);
-      WideCharToMultiByte(CP_UTF8, 0, wide_str.data(), -1, &utf8_str[0],
-                          size_needed, nullptr, nullptr);
+      WideCharToMultiByte(CP_UTF8, 0, wide_str.data(), static_cast<int>(wide_str.length()), &utf8_str[0], size_needed,
+                          nullptr, nullptr);
       return utf8_str;
     }
     return std::string();
@@ -285,6 +322,4 @@ class WindowsFileWatcher : public FileWatcherImpl {
 };
 
 // Factory function for Windows implementation
-std::unique_ptr<FileWatcherImpl> create_windows_file_watcher_impl() {
-  return std::make_unique<WindowsFileWatcher>();
-}
+std::unique_ptr<FileWatcherImpl> create_windows_file_watcher_impl() { return std::make_unique<WindowsFileWatcher>(); }
