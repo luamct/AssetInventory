@@ -2,9 +2,9 @@ cmake_minimum_required(VERSION 3.21)
 
 # Enable Objective-C++ for macOS platform features (drag-and-drop, etc.)
 if(APPLE)
-    project(AssetVault VERSION 1.0.0 LANGUAGES C CXX OBJCXX)
+    project(AssetVault VERSION 0.2.1 LANGUAGES C CXX OBJCXX)
 else()
-    project(AssetVault VERSION 1.0.0 LANGUAGES C CXX)
+    project(AssetVault VERSION 0.2.1 LANGUAGES C CXX)
 endif()
 
 option(ASSET_VAULT_STATIC_MSVC_RUNTIME "Link the MSVC runtime statically" OFF)
@@ -291,6 +291,9 @@ if(PLATFORM_WINDOWS)
         src/main.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/resources/app_icon.rc
     )
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/resources/app_icon.rc PROPERTIES
+        COMPILE_DEFINITIONS "AV_VERSION_MAJOR=${PROJECT_VERSION_MAJOR};AV_VERSION_MINOR=${PROJECT_VERSION_MINOR};AV_VERSION_PATCH=${PROJECT_VERSION_PATCH}"
+    )
 else()
     add_executable(AssetVault
         src/main.cpp
@@ -330,9 +333,9 @@ if(PLATFORM_MACOS)
         MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in
         MACOSX_BUNDLE_BUNDLE_NAME "Asset Vault"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.gamedev.assetvault"
-        MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0"
-        MACOSX_BUNDLE_LONG_VERSION_STRING "1.0.0"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0.0"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_LONG_VERSION_STRING "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
         MACOSX_BUNDLE_ICON_FILE "vault.icns"
     )
 endif()
