@@ -1,34 +1,77 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
-Keep gameplay and tooling code in `src/`, grouped by system (e.g., `texture_manager.h`, `database.cpp`). Place tests in `tests/` as `test_*.cpp` Catch2 specs. Vendor code lives in `external/`. Runtime assets (`assets/`, `images/`, `thumbnails/`) and generated data (`db/`, `logs/`) are ignored by git. Build artifacts belong under `build/`, such as `build/Debug` or `build/Release`, and Windows helper scripts reside in `scripts/`.
+Guidance for AI coding agents working in this repository. `README.md` is the user-facing overview; `readmes/` has component deep-dives.
 
-Reusable Dear ImGui widgets (icon buttons, fancy text inputs, toggle chips, wrapped text rows, etc.) live in `src/ui/components.h/.cpp`; add new generic UI pieces there so panels can share them without duplication.
+## Project
 
-## Build, Test, and Development Commands
-Configure the project once from the repo root:
-```
-cmake --preset windows
-```
-Build the Debug target whenever changes land:
-```
-cmake --build --preset windows --config Debug
-```
-Run the full verification suite before handing work back:
-```
-ctest --preset windows
-```
-Always finish by building the Debug target (`cmake --build --preset windows --config Debug`) to ensure changes compile.
-Set `VCPKG_ROOT` (e.g., `/c/vcpkg`) so dependency resolution succeeds, and clean stale builds with `rm -rf build/ vcpkg_installed/` when toolchains drift.
+AssetVault is a C++17 desktop app for browsing game asset libraries: search, thumbnails, 3D/audio preview, drag-out to other apps, and a live file watcher. Built with Dear ImGui, OpenGL 3.3, SQLite, Assimp, and miniaudio; dependencies via vcpkg; CMake presets for Windows, macOS, and Linux. MIT licensed.
 
-## Coding Style & Naming Conventions
-Use C++17 with 2-space indentation and UTF-8 encoding. Name files in `lower_snake_case`, types in `PascalCase`, functions in `lower_snake_case`, and constants in `UPPER_SNAKE_CASE`. Prefer `#include "..."` for local headers, keep diffs narrow, and only add clarifying comments for non-obvious logic.
+## Working with the user
 
-## Testing Guidelines
-Author unit tests with Catch2, naming files `tests/test_*.cpp`. Structure specs with sections and isolate fixtures via temporary resources. Build tests alongside the main target and execute them through `ctest --preset windows` or the generated binaries (e.g., `./build/DbTest`). Investigate failures before running again.
+- Be candid and critical; skip praise. If a suggestion is problematic, say so and propose an alternative.
+- Questions ("how does X work?", "what's the best way to…?") get answers, not code changes. Only change code on explicit requests ("implement", "fix", "add"). Ask when unsure.
+- **Never run git commands unless explicitly asked.** Never assume the user wants a commit.
+- **UI changes need user confirmation** — you can't see the result. Never claim a visual fix worked.
+- Always stay in the repo root; use relative paths.
+- Don't add comments that only describe the latest change (`// reduced from 3 to 1`).
+- When the user gives new guidelines, add them here.
 
-## Commit & Pull Request Guidelines
-Write focused commits with short, imperative subjects (e.g., “Fix bulk delete bugs”). For pull requests, include the rationale, platforms exercised (Windows/macOS), test evidence, linked issues, and screenshots for UI-affecting changes. Update docs such as `readmes/` whenever behavior shifts.
+## Build, run, test
 
-## Security & Configuration Tips
-Never commit `db/`, `logs/`, secrets, or credentials. Normalize paths to UTF-8 and route asset changes through the `EventProcessor`; avoid mutating the database directly. Lock the asset-map mutex before cross-thread access and coordinate any user-facing visuals with stakeholders before merging.
+Set `VCPKG_ROOT` first (`$HOME/vcpkg` on macOS/Linux, `/c/vcpkg` on Windows; use Git Bash on Windows). Use the **Debug** config during development, and finish work by making sure the Debug build compiles.
+
+```bash
+cmake --preset macos            # or: windows, windows-static, linux-static (plus *-asan variants)
+cmake --build build --config Debug
+./build/AssetVault.app/Contents/MacOS/AssetVault   # macOS
+./build/Debug/AssetVault.exe                       # Windows
+ctest --test-dir build --output-on-failure         # all tests
+```
+
+Test executables (Catch2, registered with CTest): `SearchTest`, `DbTest`, `EventProcessorTest`, `UtilsTest`, `UITest`, `IntegrationTest`, and `FileWatcherMacOSTest` / `FileWatcherWindowsTest` per platform. Tests set `TESTING=1`, which makes the app run headless and use `build/data` for its data directory. Prefer adding unit tests over ad-hoc scripts or manual checks; investigate failures before re-running. Clean build: `rm -rf build/` (add `vcpkg_installed/` when toolchains drift).
+
+## Layout
+
+- `src/` — application code, one module per system (`database.cpp`, `texture_manager.cpp`, …); `src/ui/` holds the ImGui panels and shared widgets; `src/shaders/` the GLSL sources.
+- `tests/` — Catch2 specs named `test_*.cpp`, with shared fixtures in `test_helpers.*`.
+- `external/` — vendored code not available in vcpkg (ImGui, GLAD, miniaudio, stb, fonts).
+- `images/`, `resources/` — UI icons and platform resources (Windows icon + version info).
+- `scripts/` — helper scripts (asset embedding, data reset, Windows cleanup).
+- `.github/workflows/` — CI that builds and publishes the Windows and macOS releases.
+- `build/`, `logs/`, and the per-user data directory are generated and git-ignored.
+
+## Architecture
+
+**Event-driven pipeline.** All asset changes — the initial scan and runtime file-watcher events — flow through `EventProcessor` as `FileEvent`s (Created / Modified / Deleted), processed in batches into the database, the in-memory asset map, and the search index. Never write to the database or asset map directly. `FileEvent` has no default constructor; use `FileEvent(type, path)`.
+
+**Services.** `src/services.h` is a static service locator (`Services::provide(...)` at startup, `Services::database()` etc. afterwards). Tests inject mocks the same way. The shared asset map is a mutex-guarded `SafeAssets`; lock it for any cross-thread access.
+
+**Threads.** Main thread runs ImGui; `EventProcessor` and `FileWatcher` each run their own background thread. Progress is reported via atomics.
+
+**UI.** `src/ui/` is panel-based: `search_panel`, `results_panel`, `preview_panel`, `tree_panel`, with shared widgets (icon buttons, text inputs, toggle chips, wrapped rows) in `components.h/.cpp` — add reusable widgets there. All colors come from `Theme::` in `src/theme.h`; never hardcode color values.
+
+**Data.** Database, thumbnails, and settings (including the user-chosen assets directory) live in a per-user data directory — `%LOCALAPPDATA%\AssetVault` on Windows, `~/Library/Application Support/AssetVault` on macOS — resolved by `Config::get_data_directory()`. The assets folder is chosen in-app, not by convention. Paths are normalized to UTF-8 throughout.
+
+**Asset types.** `AssetType` in `src/asset.h`: `_2D, _3D, Audio, Font, Shader, Document, Archive, Directory, Auxiliary, Unknown`. Extension mapping and string conversion live in `src/asset.cpp`; the database stores lowercase type names. To add a type, update the enum, both string conversion functions, the extension map, and the icon mapping in `texture_manager.cpp`. Always convert strings with `get_asset_type_from_string()`.
+
+**Platform code.** `file_watcher_{macos,windows}.cpp` (FSEvents / ReadDirectoryChangesW), `drag_drop_{macos.mm,windows.cpp}`. macOS atomic saves (Preview, TextEdit) arrive as rename events and must be treated as Modified — see `readmes/FILE_WATCHER.md`.
+
+**3D.** Assimp loading with multi-material support; models that fail to load are cached in `TextureManager` so they aren't retried every frame. Animation-only FBX files are accepted without geometry.
+
+## Coding style
+
+C++17, 2-space indentation, UTF-8. Files `lower_snake_case`, types `PascalCase`, functions `lower_snake_case`, constants `UPPER_SNAKE_CASE`. Prefer `#include "..."` for local headers. Keep diffs narrow; comment only non-obvious logic.
+
+- Fix all compiler warnings.
+- Avoid globals except for performance or threading; they hurt testability.
+- Keep methods that don't touch instance state `static`.
+- Follow DRY; extract shared helpers rather than duplicating patterns.
+- Update `readmes/` when behavior changes.
+
+## Commits and pull requests
+
+Focused commits with short, imperative subjects (e.g. "Fix bulk delete bugs"). Pull requests should include the rationale, platforms exercised (Windows/macOS), test evidence, linked issues, and screenshots for UI-affecting changes. Never commit secrets, credentials, logs, or generated data.
+
+## Releases
+
+`project()` in `CMakeLists.txt` is the single source of truth for the version; it feeds the Windows `VERSIONINFO` resource and the macOS bundle. Release tags are `vX.Y.Z` (optionally `-alpha` etc.) and both CI workflows fail if the tag doesn't match `project()`. Windows code signing is planned via SignPath Foundation; macOS builds are signed and notarized in CI when the Apple secrets are present.
